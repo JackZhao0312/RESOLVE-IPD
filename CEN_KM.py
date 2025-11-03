@@ -42,28 +42,43 @@ def _try_add_censors_in_bin(
 ) -> Tuple[np.ndarray, np.ndarray, int, float, int]:
     """
     Try to reduce |KM - S_target| by adding extra censors in [t_prev, t_i).
+    If the cap is reached and the tolerance still not satisfied, 
+    return the original arrays (no censors added).
     Returns (new_t, new_e, new_p, est_S, extras_added).
     """
-    t_work = base_t.copy()
-    e_work = base_e.copy()
-    p_work = int(p0)
-    est_curr = _km_survival_at(t_work, e_work, t_i)
+    # Backup original
+    t_orig = base_t.copy()
+    e_orig = base_e.copy()
+    p_orig = int(p0)
+    est_orig = _km_survival_at(t_orig, e_orig, t_i)
+
+    # Working copies
+    t_work = t_orig.copy()
+    e_work = e_orig.copy()
+    p_work = p_orig
+    est_curr = est_orig
     extras = 0
     can_sample = bin_cens_times.size > 0
 
     while (abs(est_curr - S_target) > tol) and (extras < cap) and (p_work < n):
-        if can_sample:
-            c_time = rng.choice(bin_cens_times)
-        
-            t_work[p_work] = c_time
-            e_work[p_work] = 0
-            p_work += 1
-            extras += 1
-            est_curr = _km_survival_at(t_work, e_work, t_i)
-            if debug:
-                print(f'Added censor at {c_time:.4f}, new est_S={est_curr:.6f}, error = {est_curr - S_target:.6f}')
-        else:
+        if not can_sample:
             break
+
+        c_time = rng.choice(bin_cens_times)
+        t_work[p_work] = c_time
+        e_work[p_work] = 0
+        p_work += 1
+        extras += 1
+        est_curr = _km_survival_at(t_work, e_work, t_i)
+
+        if debug:
+            print(f'Added censor at {c_time:.4f}, new est_S={est_curr:.6f}, error = {est_curr - S_target:.6f}')
+
+    # If still outside tolerance after reaching cap, revert to original
+    if (abs(est_curr - S_target) > tol) and (extras >= cap):
+        if debug:
+            print(f"Reached censor cap ({cap}) but |est_S - target|={abs(est_curr - S_target):.6f} > tol={tol:.6f}, reverting all.")
+        return t_orig, e_orig, p_orig, est_orig, 0
 
     return t_work, e_work, p_work, est_curr, extras
 
@@ -297,64 +312,95 @@ def get_ipd(
             if debug:
                 print(f'  Placed death at {t_i:.4f}, new est_S={est_S:.6f}, error = {diff:.6f}')
 
-        # ---- 2.5) Branch-and-compare with extra censors (your request) ----
-        # We now decide whether to KEEP the last death or REVERT it,
-        # but before deciding we try adding extra censors for both branches.
-
+        # ---- 2.5) Branch-and-compare with extra censors (AFTER: m+1, BEFORE: m, WAY_BEFORE: m-1) ----
+        # We now decide among three candidates:
+        #   AFTER      -> keep all deaths placed in this bin (n_died = m+1)
+        #   BEFORE     -> revert the last placed death          (n_died = m)
+        #   WAY_BEFORE -> revert the last TWO placed deaths     (n_died = m-1), if n_died >= 2
         if n_died > 0:
-            # Current arrays are the "after" scenario (last death kept)
+            # ---------- AFTER (m+1) ----------
             IPD_t_after = IPD_t.copy()
             IPD_e_after = IPD_e.copy()
             p_after = p + n_died
             est_after = _km_survival_at(IPD_t_after, IPD_e_after, t_i)
+            IPD_t_after2, IPD_e_after2, p_after2, est_after2, extras_after = _try_add_censors_in_bin(
+                IPD_t_after, IPD_e_after, p_after, n, S_target, t_prev, t_i,
+                bin_cens_times, match_tol, max_extra_censors_per_bin, rng, debug=debug
+            )
+            err_after = abs(est_after2 - S_target)
 
-            # Build "before" scenario by reverting the last death
+            # ---------- BEFORE (m) ----------
             last_idx = death_indices_this_bin[-1]
             IPD_t_before = IPD_t.copy()
             IPD_e_before = IPD_e.copy()
+            # revert the last death to a tail censor at maxFU
             IPD_t_before[last_idx] = maxFU
             IPD_e_before[last_idx] = 0
-            # Note: reverting doesn't advance p; the reverted slot becomes a tail censor at maxFU
             p_before = p + (n_died - 1)
             est_before = _km_survival_at(IPD_t_before, IPD_e_before, t_i)
-
-            # For each branch, try to repair with extra censors in the bin
-            IPD_t_after2, IPD_e_after2, p_after2, est_after2, extras_after = _try_add_censors_in_bin(
-                IPD_t_after, IPD_e_after, p_after,n, S_target, t_prev, t_i,
-                bin_cens_times, match_tol, max_extra_censors_per_bin,rng,debug=debug
-            )
             IPD_t_before2, IPD_e_before2, p_before2, est_before2, extras_before = _try_add_censors_in_bin(
                 IPD_t_before, IPD_e_before, p_before, n, S_target, t_prev, t_i,
                 bin_cens_times, match_tol, max_extra_censors_per_bin, rng, debug=debug
             )
-
-            # Compare the two repaired branches
-            err_after = abs(est_after2 - S_target)
             err_before = abs(est_before2 - S_target)
 
-            if debug:
-                print(f"  Before branch: n_died={n_died-1}, extras={extras_before}, est_S={est_before2:.6f}, err={err_before:.6f}")
-                print(f"  After branch: n_died={n_died}, extras={extras_after}, est_S={est_after2:.6f}, err={err_after:.6f}")
+            # ---------- WAY_BEFORE (m-1), if available ----------
+            have_way_before = (n_died >= 2)
+            if have_way_before:
+                last2_idx = death_indices_this_bin[-2]
+                IPD_t_way = IPD_t_before.copy()
+                IPD_e_way = IPD_e_before.copy()
+                # also revert the second-to-last death
+                IPD_t_way[last2_idx] = maxFU
+                IPD_e_way[last2_idx] = 0
+                p_way = p + (n_died - 2)
+                est_way = _km_survival_at(IPD_t_way, IPD_e_way, t_i)
+                IPD_t_way2, IPD_e_way2, p_way2, est_way2, extras_way = _try_add_censors_in_bin(
+                    IPD_t_way, IPD_e_way, p_way, n, S_target, t_prev, t_i,
+                    bin_cens_times, match_tol, max_extra_censors_per_bin, rng, debug=debug
+                )
+                err_way = abs(est_way2 - S_target)
 
-            if (err_after < err_before) or (np.isfinite(err_after) and not np.isfinite(err_before)):
-                # Keep AFTER branch
-                IPD_t = IPD_t_after2
-                IPD_e = IPD_e_after2
-                p = p_after2
-                est_curr = est_after2
-                reverted_last_death = False
-            else:
-                # Keep BEFORE branch
-                IPD_t = IPD_t_before2
-                IPD_e = IPD_e_before2
-                p = p_before2
-                est_curr = est_before2
-                # update n_died/death_indices to reflect reverted state
-                if len(death_indices_this_bin) > 0:
-                    # The last death has been reverted in this chosen branch
+            # ---------- Choose the best branch ----------
+            # Build comparison table
+            candidates = [
+                ("after",  err_after,  IPD_t_after2,  IPD_e_after2,  p_after2,  est_after2,  0),  # pop 0
+                ("before", err_before, IPD_t_before2, IPD_e_before2, p_before2, est_before2, 1),  # pop 1
+            ]
+            if have_way_before:
+                candidates.append(
+                    ("way_before", err_way, IPD_t_way2, IPD_e_way2, p_way2, est_way2, 2)        # pop 2
+                )
+
+            # Prefer the candidate with the smallest absolute error;
+            # tie-breaker: more deaths first (after > before > way_before), you can change this if you prefer.
+            # So we'll sort by (error, tie_rank) where AFTER has lowest tie_rank.
+            tie_rank = {"after": 0, "before": 1, "way_before": 2}
+            best = min(candidates, key=lambda c: (c[1], tie_rank[c[0]]))
+            best_name, best_err, best_t, best_e, best_p, best_est, pops = best
+
+            if debug:
+                msg = [f"  AFTER:  extras={extras_after},  est_S={est_after2:.6f}, err={err_after:.6f}",
+                       f"  BEFORE: extras={extras_before}, est_S={est_before2:.6f}, err={err_before:.6f}"]
+                if have_way_before:
+                    msg.append(f"  WAY_BEFORE: extras={extras_way}, est_S={est_way2:.6f}, err={err_way:.6f}")
+                print("\n".join(msg))
+                print(f"  >> Chosen branch: {best_name} (pop {pops}) with err={best_err:.6f}")
+
+            # Apply the chosen branch
+            IPD_t = best_t
+            IPD_e = best_e
+            p = best_p
+            est_curr = best_est
+
+            # Update death bookkeeping to reflect how many last deaths were reverted
+            for _ in range(pops):
+                if death_indices_this_bin:
                     death_indices_this_bin.pop()
                     n_died -= 1
-                reverted_last_death = True
+
+            reverted_last_death = (best_name != "after")
+
         else:
             # No deaths placed; just attempt extra censors (single branch)
             IPD_t, IPD_e, p, est_curr, _ = _try_add_censors_in_bin(
